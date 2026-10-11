@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sarvam Paper Lab — Research Paper Summarizer & Voice Q&amp;A</title>
+  <meta name="description" content="Upload a research paper, get a structured summary read aloud, and test your understanding with a voice Q&A tutor — powered by Sarvam AI (Sarvam Vision, Sarvam-105B, Saaras, Bulbul)." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="grid-bg" aria-hidden="true"></div>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">▍</span>
+      <span class="brand-name">sarvam<span class="dim">/</span>paper-lab</span>
+      <span class="tag">v0.1</span>
+    </div>
+    <div class="sys" id="sys-status">
+      <span class="sys-item"><span class="dot" id="dot-key"></span><span id="sys-key">checking key…</span></span>
+      <span class="sys-item mono dim" id="sys-models">—</span>
+    </div>
+  </header>
+
+  <main class="layout">
+    <h1 class="sr-only">Sarvam Paper Lab: research paper summarizer and voice Q&amp;A</h1>
+
+    <!-- ============ PANEL 01: INGEST + SUMMARY ============ -->
+    <section class="panel" id="panel-summary" aria-labelledby="h-summary">
+      <div class="panel-head">
+        <h2 id="h-summary"><span class="idx">01</span> ingest <span class="dim">→</span> summarize <span class="dim">→</span> speak</h2>
+        <span class="chip mono" id="paper-state-chip">idle</span>
+      </div>
+
+      <!-- Upload -->
+      <label class="dropzone" id="dropzone" for="file-input">
+        <input type="file" id="file-input" accept="application/pdf,.pdf" hidden />
+        <div class="dz-inner">
+          <div class="dz-icon mono" aria-hidden="true">[ pdf ]</div>
+          <div class="dz-text">
+            <strong>Drop a research paper</strong> or <span class="link">browse</span>
+            <div class="dim small mono">any length · auto-split into ≤10-page OCR chunks · max 50 MB</div>
+          </div>
+        </div>
+      </label>
+
+      <!-- OCR progress -->
+      <div class="ocr hidden" id="ocr-box">
+        <div class="row between">
+          <span class="mono small" id="ocr-file">—</span>
+          <span class="mono small dim" id="ocr-count">0/0</span>
+        </div>
+        <div class="segbar" id="ocr-segbar"></div>
+        <div class="mono small stage" id="ocr-stage"><span class="spinner"></span> starting…</div>
+      </div>
+
+      <!-- Paper meta -->
+      <div class="meta hidden" id="meta-box">
+        <div class="stats">
+          <div class="stat"><span class="k">pages</span><span class="v" id="m-pages">0</span></div>
+          <div class="stat"><span class="k">chunks</span><span class="v" id="m-chunks">0</span></div>
+          <div class="stat"><span class="k">chars</span><span class="v" id="m-chars">0</span></div>
+          <div class="stat"><span class="k">paper_id</span><span class="v mono small" id="m-id">—</span></div>
+        </div>
+        <ul class="warnings hidden" id="m-warnings"></ul>
+        <details class="preview">
+          <summary class="mono small">extracted text preview</summary>
+          <pre id="m-preview"></pre>
+        </details>
+        <div class="row gap">
+          <button class="btn primary" id="btn-summarize" type="button">
+            <span class="btn-label">Generate summary</span><kbd>S</kbd>
+          </button>
+          <button class="btn ghost" id="btn-new" type="button">New paper</button>
+        </div>
+      </div>
+
+      <!-- Summary -->
+      <article class="summary hidden" id="summary-box" aria-live="polite">
+        <div class="summary-toolbar">
+          <span class="mono small dim" id="summary-meta">summary</span>
+          <div class="row gap-s">
+            <select id="voice-select" class="select mono small" aria-label="Voice">
+              <option value="shubh_en_narration">shubh · narration</option>
+              <option value="simran_en_narration">simran · narration</option>
+              <option value="kalpit_en_edtech">kalpit · edtech</option>
+              <option value="ritu_en_edtech">ritu · edtech</option>
+              <option value="girish_en_documentary">girish · documentary</option>
+              <option value="aparna_en_edtech">aparna · edtech</option>
+            </select>
+            <select id="pace-select" class="select mono small" aria-label="Speaking pace">
+              <option value="0.9">0.9×</option>
+              <option value="1" selected>1.0×</option>
+              <option value="1.15">1.15×</option>
+              <option value="1.3">1.3×</option>
+            </select>
+            <button class="btn" id="btn-read" type="button"><span class="btn-label">▶ Read aloud</span></button>
+          </div>
+        </div>
+        <audio id="summary-audio" class="player hidden" controls preload="none"></audio>
+        <div class="md" id="summary-content"></div>
+      </article>
+    </section>
+
+    <!-- ============ PANEL 02: VOICE Q&A ============ -->
+    <section class="panel" id="panel-qa" aria-labelledby="h-qa">
+      <div class="panel-head">
+        <h2 id="h-qa"><span class="idx">02</span> voice q&amp;a <span class="dim">·</span> concept check</h2>
+        <button class="btn ghost small" id="btn-reset" type="button" title="Clear conversation memory">reset</button>
+      </div>
+
+      <ol class="pipeline mono small" id="pipeline" aria-label="Voice pipeline">
+        <li data-step="listen">listen</li>
+        <li data-step="transcribe">transcribe</li>
+        <li data-step="think">think</li>
+        <li data-step="speak">speak</li>
+      </ol>
+
+      <div class="chat" id="chat" aria-live="polite">
+        <div class="empty" id="chat-empty">
+          <p class="mono dim small">// upload a paper, then hold the button and ask something like:</p>
+          <p class="hint">"What problem does this paper solve?"</p>
+          <p class="hint">"I think the attention layer replaces recurrence — is that right?"</p>
+        </div>
+      </div>
+
+      <div class="mic-zone">
+        <button class="mic" id="btn-mic" type="button" disabled aria-label="Hold to talk">
+          <svg class="ring" viewBox="0 0 120 120" aria-hidden="true">
+            <circle class="ring-bg" cx="60" cy="60" r="54" />
+            <circle class="ring-fg" id="ring-fg" cx="60" cy="60" r="54" />
+          </svg>
+          <span class="mic-core">
+            <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true"><path fill="currentColor" d="M12 15a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3Zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-2.08A7 7 0 0 0 19 12h-2Z"/></svg>
+          </span>
+        </button>
+        <div class="mic-info">
+          <div class="mono" id="mic-label">hold to talk <kbd>space</kbd></div>
+          <canvas id="level" width="220" height="28" aria-hidden="true"></canvas>
+          <div class="mono small dim" id="mic-timer">00.0s / 30s</div>
+        </div>
+      </div>
+
+      <form class="ask-form" id="ask-form" autocomplete="off">
+        <span class="prompt mono" aria-hidden="true">&gt;</span>
+        <input id="ask-input" type="text" placeholder="…or type a question" disabled aria-label="Type a question" />
+        <button class="btn" id="btn-ask" type="submit" disabled>ask</button>
+      </form>
+    </section>
+  </main>
+
+  <footer class="console" id="console">
+    <div class="console-head mono small">
+      <span>console</span>
+      <button class="btn ghost small" id="btn-console" type="button">toggle</button>
+    </div>
+    <div class="console-body mono small" id="console-body"></div>
+  </footer>
+
+  <div class="toast hidden" id="toast" role="alert"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

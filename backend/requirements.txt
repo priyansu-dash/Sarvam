@@ -1,0 +1,7 @@
+sarvamai>=0.1.0
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-dotenv>=1.0
+httpx>=0.27
+pypdf>=4.0
+python-multipart>=0.0.9
