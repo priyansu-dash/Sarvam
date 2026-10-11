@@ -119,29 +119,28 @@ curl -X POST https://api.sarvam.ai/v1/chat/completions \
 This is the OCR layer. It is an **async, job-based** flow: create → poll → download.
 
 - **Digitise (full-document OCR):** `POST https://api.sarvam.ai/doc-ai/v1/job/digitise`
-  - multipart form: `file` (PDF/PNG/JPG/ZIP), `language` (e.g. `en-IN`), `output_format` (`html` | `md` | `json`)
+  - multipart form: `file` (PDF/PNG/JPG/ZIP), `language` (e.g. `en-IN`). Digitise takes `file` + `language` (not `output_format`).
 - **Poll status:** `GET https://api.sarvam.ai/doc-ai/v1/job/{job_id}/status` — wait for `completed` / `partially_completed`.
-- **Fetch output:** `GET https://api.sarvam.ai/doc-ai/v1/job/{job_id}/download-url` — returns a URL to a **ZIP** containing the `.md`/`.html` plus page-level JSON.
+- **Read output:** `GET https://api.sarvam.ai/doc-ai/v1/job/{job_id}/results` — returns JSON `documents[].pages[].content` (try formats md, json, html, or none).
+- **Fetch download fallback:** `GET https://api.sarvam.ai/doc-ai/v1/job/{job_id}/download-url` — presigned ZIP download if results endpoint returns no text.
 
 ```python
 with open("paper.pdf", "rb") as f:
     job = client.doc_ai.digitise(
         file=[("paper.pdf", f, "application/pdf")],
         language="en-IN",
-        output_format="md",
     )
 
 status = client.doc_ai.get_status(job_id=job.job_id)   # poll until completed
-dl = client.doc_ai.get_download_url(job_id=job.job_id)
-# download the ZIP at dl.url, unzip, read the .md file
+# read output from GET /results (try md/json/html/none), falling back to GET /download-url (presigned ZIP)
 ```
 
 **Hard limits you MUST handle:**
 - **Max 10 pages per PDF** (`400 invalid_request_error` if exceeded). Research papers are often longer, so **always split the PDF into ≤10-page chunks before calling Digitise** — see §7.1 for the required strategy.
 - **Max 200 MB per file.**
 - **Rate limit: 10 requests/minute.**
-- Parameter names matter: use `language` (NOT `language_code` — that is ignored and defaults to Hindi) and `output_format` value `"md"` (NOT `"markdown"` — that returns `400`). Default language when omitted is Hindi, so **always pass `language="en-IN"` for English papers.**
-- Output arrives as a ZIP — you must download and unzip it; do not expect raw text in the job response.
+- Parameter names matter: use `language` (NOT `language_code` — that is ignored and defaults to Hindi). Default language when omitted is Hindi, so **always pass `language="en-IN"` for English papers.**
+- Digitise takes `file` + `language`; read output from `GET /results` (JSON `documents[].pages[].content`, try md/json/html/none), falling back to `GET /download-url` (presigned ZIP).
 
 > **Legacy note:** an older flow exists under `POST /doc-digitization/job/v1` (create → upload-files → start → status → download-files). Use the newer `/doc-ai/v1` `digitise` flow. If the SDK's `doc_ai` group is unavailable in the installed version, fall back to the legacy REST flow.
 
@@ -250,7 +249,7 @@ Do these in order. Each phase should end in something you can run and see workin
 ### Phase 2 — Backend: OCR ingestion (Document Intelligence)
 - [ ] Route `POST /api/upload` accepting a PDF (multipart).
 - [ ] **Split the PDF into ≤10-page chunks first** (`pdf_chunker.py`, using `pypdf`). This is mandatory — the API rejects any file over 10 pages. See §7.1.
-- [ ] For each chunk: call `doc_ai.digitise(...)` with `language="en-IN"`, `output_format="md"`, poll `get_status` until terminal, then `get_download_url`, download the ZIP, unzip, read the `.md`.
+- [ ] For each chunk: call `doc_ai.digitise(...)` with `file` and `language="en-IN"`, poll `get_status` until terminal, read output from `GET /results` (trying md/json/html/none), falling back to `GET /download-url` (presigned ZIP).
 - [ ] Process chunks **sequentially** (the endpoint is rate-limited to 10 requests/minute) and **concatenate the Markdown in original page order** into one document.
 - [ ] Store the concatenated text keyed by a generated `paper_id` (start with an in-memory dict; note it resets on restart).
 - [ ] Return `{ paper_id, page_count, chunk_count, char_count, preview }`.
@@ -323,7 +322,7 @@ Address each of these explicitly in the code.
 
 6. **TTS returns base64.** Decode it. Also keep TTS text under 2,500 chars per REST call — chunk longer summaries at sentence boundaries.
 
-7. **Parameter-name traps:** Document AI uses `language` (not `language_code`) and `output_format="md"` (not `"markdown"`). TTS/STT use `language_code`. Don't mix them up.
+7. **Parameter-name traps:** Document AI `digitise` uses `language` (not `language_code`), taking `file` + `language`. Output is read from `GET /results` (JSON `documents[].pages[].content`, trying md/json/html/none), falling back to `GET /download-url` (presigned ZIP). TTS/STT use `language_code`. Don't mix them up.
 
 8. **Rate limits:** Document AI is 10 req/min. Add retry-with-backoff on `429` and `503`. Handle `403` as an invalid/missing key.
 
@@ -370,7 +369,7 @@ Load it with `python-dotenv` at startup. Provide `.env.example` with a placehold
 | Capability | Endpoint | Model | Key params |
 |---|---|---|---|
 | Reasoning / chat | `POST /v1/chat/completions` | `sarvam-105b` | `messages`, `max_tokens`, `reasoning_effort` |
-| OCR / paper reading | `POST /doc-ai/v1/job/digitise` | Sarvam Vision | `file`, `language="en-IN"`, `output_format="md"` |
+| OCR / paper reading | `POST /doc-ai/v1/job/digitise` | Sarvam Vision | `file`, `language="en-IN"` |
 | Speech → text | `POST /speech-to-text` | `saaras:v4` | `file`, `mode="codemix"`, `keyterms` |
 | Text → speech (REST) | `POST /text-to-speech` | `bulbul:v4-flash` | `text`, `language_code`, `speaker` |
 | Text → speech (stream) | `POST /text-to-speech/stream` | `bulbul:v4-flash` | `text`, `language_code`, `speaker`, `output_audio_codec` |

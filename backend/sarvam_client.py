@@ -28,7 +28,7 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 log = logging.getLogger("sarvam")
 
-BASE_URL = "https://api.sarvam.ai"
+BASE_URL = os.getenv("SARVAM_BASE_URL", "https://api.sarvam.ai").rstrip("/")
 
 # ---- Model / voice defaults (one TTS model + its own voice catalogue) ----
 CHAT_MODEL = "sarvam-105b"
@@ -166,14 +166,39 @@ async def chat(messages: list[dict[str, str]], *, max_tokens: int = 4096,
 
 # --------------------------------------------------------------------------
 # Document Intelligence (Sarvam Vision) — async job flow
+#
+#   POST /doc-ai/v1/job/digitise          -> {job_id, status, run_id}
+#   GET  /doc-ai/v1/job/{id}/status       -> {status, usage{pages_*}, ...}
+#   GET  /doc-ai/v1/job/{id}/results      -> {documents:[{pages:[{page_number, content}]}], ...}
+#   GET  /doc-ai/v1/job/{id}/download-url -> {method, url, headers, expires_at}  (ZIP/file)
+#
+# Results are only served for terminal jobs (409 before that).
 # --------------------------------------------------------------------------
 TERMINAL_STATUSES = {"completed", "partially_completed", "failed", "rejected"}
 
+# `format` on /results picks the output representation. Try in order of usefulness and only
+# move on when the server says the format is unsupported (400/415/422).
+_RESULT_FORMATS: tuple[str | None, ...] = ("md", "json", "html", None)
+_FORMAT_REJECTED = {400, 415, 422}
+
+_HTML_HINT = re.compile(r"</?(p|h[1-6]|div|table|tr|td|th|ul|ol|li|br|span|strong|em|b|i|sup|sub)\b", re.I)
+
+
+def _looks_like_html(s: str) -> bool:
+    return bool(_HTML_HINT.search(s))
+
 
 def _html_to_md(content: str) -> str:
-    """Fallback converter if Sarvam outputs HTML instead of pure Markdown."""
+    """Convert the HTML Sarvam Vision emits (headings, paragraphs, lists, tables) to Markdown."""
     s = content
-    s = re.sub(r"<h([1-6])[^>]*>(.*?)</h\1>", lambda m: f"\n\n{'#' * int(m.group(1))} {m.group(2).strip()}\n\n", s, flags=re.S | re.I)
+    s = re.sub(r"<!--.*?-->", "", s, flags=re.S)
+    s = re.sub(r"<(script|style)[^>]*>.*?</\1>", "", s, flags=re.S | re.I)
+    s = re.sub(r"<h([1-6])[^>]*>(.*?)</h\1>",
+               lambda m: f"\n\n{'#' * int(m.group(1))} {m.group(2).strip()}\n\n", s, flags=re.S | re.I)
+    # Tables: one row per line, cells separated by " | ".
+    s = re.sub(r"</t[hd]>\s*", " | ", s, flags=re.I)
+    s = re.sub(r"</tr>", "\n", s, flags=re.I)
+    s = re.sub(r"</?(table|thead|tbody|tfoot)[^>]*>", "\n", s, flags=re.I)
     s = re.sub(r"<li[^>]*>(.*?)</li>", r"\n- \1", s, flags=re.S | re.I)
     s = re.sub(r"<p[^>]*>(.*?)</p>", r"\n\n\1\n\n", s, flags=re.S | re.I)
     s = re.sub(r"<br\s*/?>", "\n", s, flags=re.I)
@@ -182,14 +207,126 @@ def _html_to_md(content: str) -> str:
     s = re.sub(r"<code[^>]*>(.*?)</code>", r"`\1`", s, flags=re.S | re.I)
     s = re.sub(r"<[^>]+>", "", s)
     s = html.unescape(s)
+    s = re.sub(r"[ \t]+\n", "\n", s)
+    s = re.sub(r" \| *\n", "\n", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
 
 
-async def digitise_create(pdf_bytes: bytes, filename: str, language: str = "en-IN", output_format: str = "md") -> str:
-    """Create a digitise job. NOTE: param is `language`, not `language_code`."""
+def _normalise_text(s: str) -> str:
+    s = s or ""
+    return _html_to_md(s) if _looks_like_html(s) else s.strip()
+
+
+def _block_to_md(block: dict[str, Any]) -> str:
+    """Render one JSON layout block ({text, tag, bbox}) as Markdown."""
+    text = (block.get("text") or block.get("content") or "").strip()
+    if not text:
+        return ""
+    tag = str(block.get("tag") or block.get("type") or "").lower()
+    m = re.fullmatch(r"h([1-6])", tag)
+    if m:
+        return f"{'#' * int(m.group(1))} {text}"
+    if tag in {"title", "heading", "section-header", "section_header"}:
+        return f"## {text}"
+    if tag in {"list-item", "list_item", "li"}:
+        return f"- {text}"
+    return text
+
+
+def _page_text(page: dict[str, Any]) -> str:
+    content = page.get("content")
+    if isinstance(content, str) and content.strip():
+        return _normalise_text(content)
+    for key in ("markdown", "md", "html", "text"):
+        val = page.get(key)
+        if isinstance(val, str) and val.strip():
+            return _normalise_text(val)
+    blocks = page.get("blocks")
+    if isinstance(blocks, list):
+        parts = [_block_to_md(b) for b in blocks if isinstance(b, dict)]
+        return "\n\n".join(p for p in parts if p)
+    return ""
+
+
+def _text_from_json(body: Any) -> str:
+    """Pull page text out of a digitise results payload, in page order."""
+    if isinstance(body, list):
+        return "\n\n".join(t for t in (_text_from_json(b) for b in body) if t)
+    if not isinstance(body, dict):
+        return ""
+    pages: list[tuple[int, str]] = []
+    docs = body.get("documents")
+    if isinstance(docs, dict):
+        docs = [docs]
+    for d_idx, doc in enumerate(docs or []):
+        for i, page in enumerate((doc or {}).get("pages") or []):
+            if not isinstance(page, dict):
+                continue
+            txt = _page_text(page)
+            if txt.strip():
+                pages.append((d_idx * 100_000 + int(page.get("page_number") or i + 1), txt))
+    if not pages and isinstance(body.get("pages"), list):  # per-page file inside a ZIP
+        for i, page in enumerate(body["pages"]):
+            if isinstance(page, dict):
+                txt = _page_text(page)
+                if txt.strip():
+                    pages.append((int(page.get("page_number") or i + 1), txt))
+    if pages:
+        pages.sort(key=lambda p: p[0])
+        return "\n\n".join(p[1].strip() for p in pages)
+    return _page_text(body)  # single-document payload with top-level content/markdown
+
+
+def _natural_key(name: str) -> list[Any]:
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", name)]
+
+
+def _text_from_zip(content: bytes) -> str:
+    with zipfile.ZipFile(io.BytesIO(content)) as z:
+        names = [n for n in z.namelist() if not n.endswith("/") and "__MACOSX" not in n]
+        for ext in (".md", ".html", ".htm", ".json", ".txt"):
+            group = sorted((n for n in names if n.lower().endswith(ext)), key=_natural_key)
+            if not group:
+                continue
+            texts: list[str] = []
+            for n in group:
+                raw = z.read(n).decode("utf-8", errors="replace")
+                if ext == ".json":
+                    try:
+                        texts.append(_text_from_json(json.loads(raw)))
+                    except ValueError:
+                        continue
+                else:
+                    texts.append(_normalise_text(raw))
+            joined = "\n\n".join(t for t in texts if t.strip())
+            if joined.strip():
+                return joined
+    return ""
+
+
+def _parse_payload(content: bytes, content_type: str = "") -> tuple[str, str]:
+    """Turn any results/download body (JSON, ZIP, Markdown, HTML, text) into (markdown, status)."""
+    if content[:4] == b"PK\x03\x04" or "zip" in content_type.lower():
+        try:
+            return _text_from_zip(content), ""
+        except zipfile.BadZipFile as exc:
+            log.error("Corrupted ZIP from Sarvam: %s", exc)
+            return "", ""
+    raw = content.decode("utf-8", errors="replace")
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        return _normalise_text(raw), ""  # plain Markdown / HTML body
+    status = body.get("status", "") if isinstance(body, dict) else ""
+    return _text_from_json(body), status
+
+
+async def digitise_create(pdf_bytes: bytes, filename: str, language: str = "en-IN") -> str:
+    """Create a digitise job. Field is `language` (BCP-47), not `language_code`; omitting it makes
+    Sarvam treat the document as Indic. Output format is chosen at /results time."""
     files = {"file": (filename, pdf_bytes, "application/pdf")}
-    data = {"language": language, "output_format": output_format}
+    data = {"language": language}
     resp = await _request("POST", "/doc-ai/v1/job/digitise", files=files, data=data)
     body = resp.json()
     job_id = body.get("job_id")
@@ -203,53 +340,46 @@ async def digitise_status(job_id: str) -> dict[str, Any]:
     return resp.json()
 
 
+async def _download_output(job_id: str) -> str:
+    """Fallback: get a presigned download URL, fetch it (usually a ZIP), and parse it."""
+    resp = await _request("GET", f"/doc-ai/v1/job/{job_id}/download-url")
+    info = resp.json()
+    url = info.get("url")
+    if not url:
+        raise SarvamError(502, "bad_upstream_response", "download-url returned no url")
+    # Presigned URL: use a plain client so our subscription key is never sent to the storage host.
+    async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=15.0), follow_redirects=True) as dl:
+        r = await dl.request((info.get("method") or "GET").upper(), url, headers=info.get("headers") or {})
+    if r.status_code >= 400:
+        raise SarvamError(502, "download_failed", f"Could not download OCR output (HTTP {r.status_code}).")
+    text, _ = _parse_payload(r.content, r.headers.get("content-type", ""))
+    return text
+
+
 async def digitise_results_markdown(job_id: str) -> tuple[str, str]:
-    """Fetch terminal results as Markdown. Returns (markdown, status).
-    Handles both ZIP downloads (standard for file jobs) and JSON responses,
-    with automatic fallback from format=md to format=html if the job produced HTML."""
-    try:
-        resp = await _request("GET", f"/doc-ai/v1/job/{job_id}/results", params={"format": "md"})
-    except SarvamError as exc:
-        if "cannot serve md" in exc.message.lower() or "html" in exc.message.lower():
-            log.warning("Job %s produced HTML; falling back to format=html", job_id)
-            resp = await _request("GET", f"/doc-ai/v1/job/{job_id}/results", params={"format": "html"})
-        else:
-            raise
-
-    content = resp.content
-    # 1. ZIP archive response (standard format for file-producing digitise jobs)
-    if content.startswith(b"PK\x03\x04") or "zip" in resp.headers.get("content-type", "").lower():
+    """Fetch a terminal job's text as Markdown. Returns (markdown, status).
+    Tries /results with several `format` values (and none); if every attempt is empty,
+    falls back to the /download-url ZIP."""
+    status = ""
+    for fmt in _RESULT_FORMATS:
         try:
-            with zipfile.ZipFile(io.BytesIO(content)) as z:
-                # Prefer .md files first
-                md_files = [n for n in z.namelist() if n.endswith(".md")]
-                if md_files:
-                    texts = [z.read(n).decode("utf-8", errors="replace").strip() for n in sorted(md_files)]
-                    return "\n\n".join(t for t in texts if t), "completed"
-                # Fallback to .html files
-                html_files = [n for n in z.namelist() if n.endswith(".html")]
-                if html_files:
-                    texts = [_html_to_md(z.read(n).decode("utf-8", errors="replace")) for n in sorted(html_files)]
-                    return "\n\n".join(t for t in texts if t), "completed"
-        except zipfile.BadZipFile as e:
-            log.error("Corrupted zip returned for job %s: %s", job_id, e)
+            resp = await _request("GET", f"/doc-ai/v1/job/{job_id}/results",
+                                  params={"format": fmt} if fmt else None)
+        except SarvamError as exc:
+            if exc.status in _FORMAT_REJECTED:
+                log.warning("Job %s: /results format=%s rejected (%s); trying next", job_id, fmt, exc.message)
+                continue
+            raise
+        text, st = _parse_payload(resp.content, resp.headers.get("content-type", ""))
+        status = st or status
+        if text.strip():
+            log.info("Job %s: parsed %d chars from /results (format=%s)", job_id, len(text), fmt)
+            return text, status or "completed"
+        log.warning("Job %s: /results (format=%s) held no text; head=%r", job_id, fmt, resp.content[:200])
 
-    # 2. JSON structured response fallback
-    try:
-        body = resp.json()
-        pages: list[tuple[int, str]] = []
-        for doc in body.get("documents") or []:
-            for i, page in enumerate(doc.get("pages") or []):
-                p_text = page.get("content") or ""
-                if "<" in p_text and ">" in p_text:
-                    p_text = _html_to_md(p_text)
-                pages.append((page.get("page_number") or i + 1, p_text))
-        pages.sort(key=lambda p: p[0])
-        md = "\n\n".join(p[1].strip() for p in pages if p[1].strip())
-        return md, body.get("status", "")
-    except Exception:
-        # 3. Plain text fallback
-        return content.decode("utf-8", errors="replace"), "completed"
+    log.warning("Job %s: falling back to /download-url", job_id)
+    text = await _download_output(job_id)
+    return text, status or "completed"
 
 
 async def digitise_wait(job_id: str, *, poll_interval: float = 3.0, timeout: float = 600.0,
@@ -260,7 +390,7 @@ async def digitise_wait(job_id: str, *, poll_interval: float = 3.0, timeout: flo
         status = await digitise_status(job_id)
         if on_progress:
             on_progress(status)
-        if status.get("status") in TERMINAL_STATUSES:
+        if (status.get("status") or "").lower() in TERMINAL_STATUSES:
             return status
         if elapsed >= timeout:
             raise SarvamError(504, "ocr_timeout", f"OCR job {job_id} did not finish within {int(timeout)}s")

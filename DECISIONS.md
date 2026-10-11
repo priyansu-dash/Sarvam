@@ -8,7 +8,7 @@ This document records key design decisions and trade-offs made while building th
 
 - **Decision**: Implemented backend communication using asynchronous `httpx` with connection pooling rather than exclusively relying on the `sarvamai` SDK wrapper.
 - **Rationale**:
-  - The Sarvam live API contracts (notably `POST /doc-ai/v1/job/digitise`, `GET /doc-ai/v1/job/{id}/results?format=md`, and `POST /text-to-speech/stream`) have precise parameter expectations (`language="en-IN"`, `output_format="md"`, model IDs `bulbul:v4-flash` vs `bulbul:v3`).
+  - The Sarvam live API contracts for Document AI digitise take `file` + `language` (not `output_format`), and read output from `GET /results` (JSON `documents[].pages[].content`, trying md/json/html/none), falling back to `GET /download-url` (presigned ZIP).
   - Native `httpx` client allows direct control over chunked HTTP streaming (`POST /text-to-speech/stream`), granular status code mapping, and configurable exponential backoff retry loops on HTTP 429 (rate limits) and 503 (service overloaded).
 
 ---

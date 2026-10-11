@@ -226,7 +226,7 @@ async def _run_ocr(paper: paper_store.Paper, chunks: list[tuple[bytes, int, int]
 
                 status = await sarvam.digitise_wait(job_id, poll_interval=OCR_POLL_SECONDS,
                                                     timeout=OCR_CHUNK_TIMEOUT, on_progress=progress)
-                st = status.get("status")
+                st = (status.get("status") or "").lower()
                 if st in ("failed", "rejected"):
                     failed_chunks += 1
                     paper.warnings.append(f"OCR {st} for {label}; those pages are missing.")
